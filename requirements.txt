@@ -1,0 +1,16 @@
+python-telegram-bot>=21.0
+httpx>=0.27.0
+sentence-transformers>=2.6.0
+numpy>=1.24.0
+sqlite-vec>=0.1.6
+python-dotenv>=1.0.0
+Pillow>=10.0.0
+
+# Local image → text (BLIP, LLaVA, …)
+transformers>=4.41.0
+accelerate>=0.27.0
+torch
+
+# Optional backends (uncomment or pip install separately):
+# pytesseract>=0.3.10   # only if IMAGE_TEXT_BACKEND=tesseract
+# clip-interrogator     # only if IMAGE_TEXT_BACKEND=clip_interrogator

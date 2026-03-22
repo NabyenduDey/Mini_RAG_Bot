@@ -1,0 +1,7 @@
+Security basics (sample knowledge)
+
+Phishing: Do not click links in unexpected messages asking for passwords. Report suspicious email to security@example.com with headers attached.
+
+Laptops: Full-disk encryption is mandatory. Lock your screen when stepping away. Lost devices must be reported within one hour.
+
+API keys: Store keys in the approved secrets manager only. Rotate keys after team member offboarding.

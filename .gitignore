@@ -1,0 +1,20 @@
+# Secrets — never commit
+.env
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local RAG database (regenerated / personal)
+data/*.db
+data/*.sqlite*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
