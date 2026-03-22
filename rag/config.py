@@ -101,28 +101,85 @@ EMBEDDING_MODEL = os.environ.get(
     "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
 EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
+EMBEDDING_BATCH_SIZE = max(1, int(os.environ.get("EMBEDDING_BATCH_SIZE", "64")))
+EMBEDDING_DEVICE = os.environ.get("EMBEDDING_DEVICE", "").strip() or None
+
+RAG_WARMUP_ON_START = os.environ.get("RAG_WARMUP_ON_START", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 CHUNK_MAX_CHARS = int(os.environ.get("CHUNK_MAX_CHARS", "480"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "90"))
-TOP_K = int(os.environ.get("TOP_K", "5"))
+TOP_K = int(os.environ.get("TOP_K", "2"))
+# Fetch extra neighbors then drop those much worse than the best match (reduces off-topic policy chunks on recipe queries).
+TOP_K_CANDIDATES = int(os.environ.get("TOP_K_CANDIDATES", str(max(TOP_K, 12))))
+
+
+def _parse_distance_margin() -> float:
+    """
+    Cosine/L2-style distance band around the best hit. Chunks farther than best + margin are dropped.
+
+    Important: an *empty* value in .env must NOT disable filtering (that lets every doc into CONTEXT).
+    Use RETRIEVAL_DISTANCE_MARGIN=0 or off to disable.
+    """
+    raw = os.environ.get("RETRIEVAL_DISTANCE_MARGIN")
+    if raw is None:
+        return 0.20
+    s = str(raw).strip()
+    if not s:
+        return 0.20
+    if s.lower() in ("0", "off", "false", "none"):
+        return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return 0.20
+
+
+RETRIEVAL_DISTANCE_MARGIN = _parse_distance_margin()
+# Stop adding chunks after a large jump in distance (removes the next “cluster” of unrelated docs).
+_elb = os.environ.get("RETRIEVAL_ELBOW_GAP", "0.13").strip()
+try:
+    RETRIEVAL_ELBOW_GAP = float(_elb) if _elb else 0.13
+except ValueError:
+    RETRIEVAL_ELBOW_GAP = 0.13
+
+# Lower temperature reduces made-up “bonus” policy lines when CONTEXT is narrow.
+_ot = os.environ.get("OLLAMA_TEMPERATURE", "0.2").strip()
+try:
+    OLLAMA_TEMPERATURE = float(_ot) if _ot else 0.2
+except ValueError:
+    OLLAMA_TEMPERATURE = 0.2
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "llama3.2")
+# Optional Ollama generation caps (smaller / faster replies). See ollama.com docs for options.
+OLLAMA_NUM_PREDICT = os.environ.get("OLLAMA_NUM_PREDICT", "").strip()
+OLLAMA_NUM_CTX = os.environ.get("OLLAMA_NUM_CTX", "").strip()
+OLLAMA_HTTP_TIMEOUT = float(os.environ.get("OLLAMA_HTTP_TIMEOUT", "180"))
 
 # Image → text: local Hugging Face (or optional Tesseract)
-# blip_vqa | blip_caption | llava | clip_interrogator | tesseract
-# Aliases: blip → blip_vqa; clip | clip-interrogator → clip_interrogator
-_raw_ib = os.environ.get("IMAGE_TEXT_BACKEND", "blip_vqa").strip().lower()
+# blip2 (recommended for screenshot / UI text) | llava | clip_interrogator |
+# blip_vqa | blip_caption | tesseract
+# Aliases: blip → blip2; clip | clip-interrogator → clip_interrogator
+_raw_ib = os.environ.get("IMAGE_TEXT_BACKEND", "blip2").strip().lower()
 if _raw_ib == "blip":
-    IMAGE_TEXT_BACKEND = "blip_vqa"
+    IMAGE_TEXT_BACKEND = "blip2"
 elif _raw_ib in ("clip", "clip-interrogator"):
     IMAGE_TEXT_BACKEND = "clip_interrogator"
+elif _raw_ib in ("blip-2", "blip_2"):
+    IMAGE_TEXT_BACKEND = "blip2"
 else:
     IMAGE_TEXT_BACKEND = _raw_ib
 
 IMAGE_TEXT_MODEL = os.environ.get("IMAGE_TEXT_MODEL", "").strip()
 HF_IMAGE_DEVICE = os.environ.get("HF_IMAGE_DEVICE", "auto").strip()
 HF_IMAGE_MAX_NEW_TOKENS = int(os.environ.get("HF_IMAGE_MAX_NEW_TOKENS", "256"))
+# BLIP-2: beam search + upscaling small screenshots improves reading UI / search-bar text.
+BLIP2_NUM_BEAMS = max(1, int(os.environ.get("BLIP2_NUM_BEAMS", "5")))
+BLIP2_UPSCALE_MIN_EDGE = max(0, int(os.environ.get("BLIP2_UPSCALE_MIN_EDGE", "640")))
 
 # Optional: full path to tesseract.exe on Windows (only if IMAGE_TEXT_BACKEND=tesseract)
 # TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe

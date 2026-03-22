@@ -7,7 +7,7 @@ Run from project root (mini_rag_telegram_bot/):
 
 User flow:
   • Text question → /ask <question>
-  • Photo / screenshot → optional caption; local image model reads text from the image
+  • Photo / screenshot → mandatory one-line caption; vision model reads on-screen text
 """
 
 from __future__ import annotations
@@ -29,8 +29,10 @@ from telegram.ext import (
 )
 
 from . import config
+from . import user_messages
+from .embeddings import encode_texts
 from .ingest import ingest_if_needed
-from .pipeline import answer_user_message
+from .pipeline import answer_user_message, close_ollama_http_client
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -76,26 +78,13 @@ def _split_telegram_text(s: str, limit: int = 4000) -> list[str]:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    await update.message.reply_text(
-        "Hi. I answer questions using your small local document library.\n\n"
-        "• Type: /ask followed by your question\n"
-        "• Or send a photo (screenshot). A local image model (e.g. BLIP) reads text from it. Add a caption to add your own words.\n"
-        "• /help — short help"
-    )
+    await update.message.reply_text(user_messages.START_INTRO)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    await update.message.reply_text(
-        "/ask <your question>\n"
-        "  Example: /ask How do I request time off?\n\n"
-        "Photo / screenshot\n"
-        "  Send an image. A local Hugging Face model reads text from the picture (see README), "
-        "combines it with your caption if any, then searches the knowledge files and replies.\n\n"
-        "Tip: default image reading uses Hugging Face (BLIP). See README for llava / tesseract.\n\n"
-        "/start — intro"
-    )
+    await update.message.reply_text(user_messages.HELP_TEXT)
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -111,13 +100,19 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.photo:
         return
+    caption = (update.message.caption or "").strip()
+    if not caption:
+        await update.message.reply_text(user_messages.PHOTO_CAPTION_REQUIRED)
+        return
+
     await update.message.chat.send_action(ChatAction.TYPING)
-    cap = (update.message.caption or "").strip()
     photo = update.message.photo[-1]
-    f = await context.bot.get_file(photo.file_id)
-    buf = io.BytesIO()
-    await f.download_to_memory(out=buf)
-    await _reply_rag(update, typed_text=cap or None, image_bytes=buf.getvalue())
+    file = await context.bot.get_file(photo.file_id)
+    buffer = io.BytesIO()
+    await file.download_to_memory(out=buffer)
+    await _reply_rag(
+        update, typed_text=caption, image_bytes=buffer.getvalue()
+    )
 
 
 async def _reply_rag(
@@ -148,17 +143,30 @@ async def _post_init(application: Application) -> None:
     logger.info("Telegram webhook cleared (safe for long polling).")
 
 
+async def _post_shutdown(application: Application) -> None:
+    await close_ollama_http_client()
+
+
 def main() -> None:
     changed, status = ingest_if_needed()
     logger.info("Knowledge index: %s — %s", changed, status)
     config.require_telegram_token()
     _log_ollama_startup_check()
 
+    if config.RAG_WARMUP_ON_START:
+        logger.info("Warming up embedding model (first query will be faster)…")
+        try:
+            encode_texts(config.EMBEDDING_MODEL, ["warmup"])
+            logger.info("Embedding model loaded.")
+        except Exception as e:
+            logger.warning("Embedding warmup failed (first /ask may be slow): %s", e)
+
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
         .concurrent_updates(True)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
