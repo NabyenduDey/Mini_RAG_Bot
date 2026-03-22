@@ -13,9 +13,32 @@ import sqlite_vec
 from .config import EMBEDDING_DIM
 
 
+def _sqlite_dbapi():
+    """
+    sqlite-vec loads a native extension; that requires SQLite compiled with
+    SQLITE_ENABLE_LOAD_EXTENSION. macOS / some Python builds ship a stdlib sqlite3
+    without ``enable_load_extension`` on the connection object — use pysqlite3 then.
+    """
+    if hasattr(sqlite3.Connection, "enable_load_extension"):
+        return sqlite3
+    try:
+        import pysqlite3.dbapi2 as pysqlite  # type: ignore[import-untyped]
+    except ImportError as e:
+        raise RuntimeError(
+            "sqlite-vec needs SQLite with extension loading, but this Python's sqlite3 "
+            "does not support it (common on macOS). Install: pip install pysqlite-binary"
+        ) from e
+    return pysqlite
+
+
+_db = _sqlite_dbapi()
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    # Autocommit avoids "cannot change into wal mode from within a transaction" with
+    # pysqlite3 (pysqlite-binary) on some setups.
+    conn = _db.connect(str(db_path), isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)

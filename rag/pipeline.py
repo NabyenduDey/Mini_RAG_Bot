@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 
 import httpx
 
@@ -19,27 +20,110 @@ from . import config
 from .embeddings import encode_texts
 from .image_text import extract_text_from_image
 from .prompts import SYSTEM_RAG, build_user_prompt
+from .user_messages import NEED_QUESTION, PHOTO_CAPTION_REQUIRED
 from .vector_store import _connect, init_schema, search
 
 logger = logging.getLogger(__name__)
 
+# One SQLite connection per thread pool worker — avoids open/close + init_schema on every query.
+_reader_local = threading.local()
+_http_lock = threading.Lock()
+_http_client: httpx.AsyncClient | None = None
+
+
+def _reader_conn():
+    conn = getattr(_reader_local, "conn", None)
+    if conn is None:
+        conn = _connect(config.SQLITE_PATH)
+        init_schema(conn)
+        _reader_local.conn = conn
+    return conn
+
+
+def _build_search_query(*, typed_message: str, text_from_image: str) -> str:
+    """
+    Text used for embedding + retrieval.
+
+    Photos must include a caption (enforced in the bot). We combine:
+    on-screen text from the vision model (if any) + the user’s one-line caption for search.
+    """
+    typed = (typed_message or "").strip()
+    from_img = (text_from_image or "").strip()
+    if from_img and typed:
+        return f"{from_img}\n\nAdditional question from the user (photo caption): {typed}"
+    if from_img:
+        return from_img
+    return typed
+
+
+def _narrow_retrieval(
+    rows: list[tuple[int, str, str, float]],
+) -> list[tuple[int, str, str, float]]:
+    """
+    Drop neighbors much farther than the best match so unrelated docs (e.g. policy vs recipe)
+    do not reach the LLM. Also cut at a “elbow” (big jump in distance) so two clusters
+    (recipe vs HR) are not merged when the user asked about one topic only.
+    """
+    if not rows:
+        return rows
+    margin = config.RETRIEVAL_DISTANCE_MARGIN
+    if margin <= 0:
+        return rows[: config.TOP_K]
+
+    best_d = rows[0][3]
+    band = [r for r in rows if r[3] <= best_d + margin]
+    if not band:
+        band = [rows[0]]
+
+    elbow = config.RETRIEVAL_ELBOW_GAP
+    out: list[tuple[int, str, str, float]] = [band[0]]
+    for i in range(1, len(band)):
+        prev_d, d = band[i - 1][3], band[i][3]
+        if d - prev_d > elbow:
+            break
+        out.append(band[i])
+        if len(out) >= config.TOP_K:
+            break
+
+    return out[: config.TOP_K]
+
 
 def _find_similar_chunks(search_text: str) -> list[tuple[int, str, str, float]]:
-    """Step 2 — vector search over ingested knowledge (runs in a worker thread from async code)."""
-    conn = _connect(config.SQLITE_PATH)
-    try:
-        init_schema(conn)
-        q = search_text.strip() or "help"
-        q_emb = encode_texts(config.EMBEDDING_MODEL, [q])[0]
-        return search(conn, q_emb, config.TOP_K)
-    finally:
-        conn.close()
+    """Vector search, then distance-margin filter (worker thread)."""
+    conn = _reader_conn()
+    q = search_text.strip() or "help"
+    q_emb = encode_texts(config.EMBEDDING_MODEL, [q])[0]
+    candidates = search(conn, q_emb, config.TOP_K_CANDIDATES)
+    return _narrow_retrieval(candidates)
+
+
+async def _ollama_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is not None:
+        return _http_client
+    with _http_lock:
+        if _http_client is None:
+            timeout = httpx.Timeout(config.OLLAMA_HTTP_TIMEOUT)
+            _http_client = httpx.AsyncClient(
+                timeout=timeout,
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            )
+    return _http_client
+
+
+async def close_ollama_http_client() -> None:
+    """Close the shared Ollama HTTP client (call from Application.post_shutdown)."""
+    global _http_client
+    with _http_lock:
+        if _http_client is not None:
+            await _http_client.aclose()
+            _http_client = None
 
 
 async def _call_ollama_chat(system: str, user: str) -> str:
     """Step 3 — ask the local LLM to produce the final reply."""
     url = f"{config.OLLAMA_BASE_URL}/api/chat"
-    payload = {
+    payload: dict = {
         "model": config.OLLAMA_CHAT_MODEL,
         "messages": [
             {"role": "system", "content": system},
@@ -47,11 +131,18 @@ async def _call_ollama_chat(system: str, user: str) -> str:
         ],
         "stream": False,
     }
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return (data.get("message") or {}).get("content", "").strip()
+    opts: dict = {"temperature": config.OLLAMA_TEMPERATURE}
+    if config.OLLAMA_NUM_PREDICT:
+        opts["num_predict"] = int(config.OLLAMA_NUM_PREDICT)
+    if config.OLLAMA_NUM_CTX:
+        opts["num_ctx"] = int(config.OLLAMA_NUM_CTX)
+    payload["options"] = opts
+
+    client = await _ollama_client()
+    r = await client.post(url, json=payload)
+    r.raise_for_status()
+    data = r.json()
+    return (data.get("message") or {}).get("content", "").strip()
 
 
 async def answer_user_message(
@@ -60,22 +151,30 @@ async def answer_user_message(
     image_bytes: bytes | None = None,
 ) -> str:
     """
-    Main entry: typed_text is from /ask or the photo caption; image_bytes is optional.
+    RAG entry: `typed_text` is /ask text or the photo caption; `image_bytes` is set for photos.
+
+    Every photo must ship with a one-line caption (checked in `on_photo` and again here).
     """
     typed = (typed_text or "").strip()
 
-    # Step 1 — text from image via local HF model (or Tesseract), in a worker thread
+    if image_bytes and not typed:
+        return PHOTO_CAPTION_REQUIRED
+
     from_image = ""
     if image_bytes:
-        from_image = await asyncio.to_thread(extract_text_from_image, image_bytes)
+        from_image = (await asyncio.to_thread(extract_text_from_image, image_bytes)).strip()
 
     if not typed and not from_image:
-        return (
-            "I need either some typed text (use /ask or a caption) or readable text in the image. "
-            "Try a clearer screenshot or add a short caption with your question."
-        )
+        return NEED_QUESTION
 
-    search_query = "\n".join(x for x in (typed, from_image) if x).strip()
+    search_query = _build_search_query(
+        typed_message=typed, text_from_image=from_image
+    ).strip()
+    if not search_query:
+        return (
+            "Could not build a search query. If you sent a photo, try a clearer screenshot "
+            "or a more specific caption."
+        )
 
     try:
         rows = await asyncio.to_thread(_find_similar_chunks, search_query)
@@ -89,6 +188,7 @@ async def answer_user_message(
         typed_message=typed,
         text_from_image=from_image,
         context=context,
+        image_attached=bool(image_bytes),
     )
 
     try:
