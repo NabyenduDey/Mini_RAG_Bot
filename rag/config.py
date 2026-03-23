@@ -104,6 +104,19 @@ EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
 EMBEDDING_BATCH_SIZE = max(1, int(os.environ.get("EMBEDDING_BATCH_SIZE", "64")))
 EMBEDDING_DEVICE = os.environ.get("EMBEDDING_DEVICE", "").strip() or None
 
+# Query embedding cache (retrieval only; ingest still uses batch encode). 0 = disabled.
+_eq_ttl = os.environ.get("EMBEDDING_QUERY_CACHE_TTL_SEC", "120").strip()
+try:
+    EMBEDDING_QUERY_CACHE_TTL_SEC = int(_eq_ttl) if _eq_ttl else 120
+except ValueError:
+    EMBEDDING_QUERY_CACHE_TTL_SEC = 120
+
+_eq_max = os.environ.get("EMBEDDING_QUERY_CACHE_MAX", "48").strip()
+try:
+    EMBEDDING_QUERY_CACHE_MAX = max(0, int(_eq_max) if _eq_max else 48)
+except ValueError:
+    EMBEDDING_QUERY_CACHE_MAX = 48
+
 RAG_WARMUP_ON_START = os.environ.get("RAG_WARMUP_ON_START", "true").lower() in (
     "1",
     "true",

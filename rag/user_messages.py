@@ -34,7 +34,5 @@ HELP_TEXT = (
     "  Example: /ask How do I request time off?\n\n"
     "Photo or screenshot\n"
     "  Mandatory: add a single-line caption before sending (Telegram’s caption box on the image).\n"
-    "  The bot reads on-screen text with a local model (BLIP-2 or LLaVA per your .env), "
-    "merges it with your caption, searches the knowledge base, then replies.\n\n"
     "/start — short intro"
 )
